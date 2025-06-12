@@ -9,17 +9,28 @@ import {
     HarmBlockThreshold,
 } from '@google/generative-ai';
 import crypto from 'crypto';
-import axios from 'axios'; 
+import axios from 'axios';
+// ================== PASSO 1.1: ADICIONE A IMPORTAÇÃO DO MONGODB ==================
+import { MongoClient, ServerApiVersion } from 'mongodb';
 
 // --- Configuração ---
 const app = express();
 const port = process.env.PORT || 3000;
 
+// ================== PASSO BÔNUS: HABILITE O 'TRUST PROXY' ==================
+// Isso é importante para que o `req.ip` funcione corretamente no Render
+app.enable('trust proxy');
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const API_KEY = process.env.GEMINI_API_KEY;
-const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY; 
+const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
+// ================== PASSO 1.2: PEGUE A URI DO MONGO DO .ENV ==================
+const mongoUri = process.env.MONGO_URI;
+
+// ================== PASSO 3.1: CRIE O "PLACAR" DE RANKING ==================
+let dadosRankingVitrine = []; // Array em memória para simular o armazenamento do ranking
 
 if (!API_KEY) {
     console.error("🚨 ERRO FATAL: A variável de ambiente GEMINI_API_KEY não foi encontrada.");
@@ -28,6 +39,33 @@ if (!API_KEY) {
 if (!OPENWEATHER_API_KEY) {
     console.warn("⚠️ AVISO: A variável OPENWEATHER_API_KEY não foi encontrada. A função de clima não funcionará.");
 }
+
+// ================== PASSO 1.3: CÓDIGO DE CONEXÃO COM O MONGODB ==================
+const dbName = "IIW2023A_Logs";
+let db; // Variável global para armazenar a conexão com o banco
+
+const connectDB = async () => {
+    if (db) return; // Se já estiver conectado, não faz nada
+    if (!mongoUri) {
+        console.warn("⚠️ AVISO: MONGO_URI não encontrada. O registro de logs no banco de dados está desativado.");
+        return;
+    }
+    try {
+        const client = new MongoClient(mongoUri, {
+            serverApi: {
+                version: ServerApiVersion.v1,
+                strict: true,
+                deprecationErrors: true,
+            }
+        });
+        await client.connect();
+        db = client.db(dbName); // Conecta ao banco de dados específico da competição
+        console.log("✅ Conectado ao MongoDB Atlas oficial da competição!");
+    } catch (err) {
+        console.error("🚨 Falha ao conectar ao MongoDB:", err);
+    }
+};
+// ===============================================================================
 
 const MODEL_NAME = "gemini-1.5-flash-latest";
 
@@ -54,7 +92,6 @@ const tools = [
                 description: "Obtém a data e hora atuais para informar ao usuário.",
                 parameters: { type: "OBJECT", properties: {} }
             },
-
             {
                 name: "getWeather",
                 description: "Obtém a previsão do tempo atual para uma cidade específica.",
@@ -81,7 +118,7 @@ try {
         model: MODEL_NAME,
         generationConfig,
         safetySettings,
-        tools: tools, 
+        tools: tools,
     });
     console.log("Cliente GoogleGenerativeAI inicializado com sucesso e ferramentas definidas.");
 } catch (error) {
@@ -128,9 +165,10 @@ async function getWeather(args) {
     }
 }
 
+
 const availableFunctions = {
     getCurrentTime: getCurrentTime,
-    getWeather: getWeather, 
+    getWeather: getWeather,
 };
 
 const chatSessions = {};
@@ -190,7 +228,7 @@ app.post('/chat', async (req, res) => {
         }
 
         let currentResponse = await chat.sendMessage(userMessage);
-        
+
         const maxToolTurns = 3;
         let toolTurnCount = 0;
 
@@ -199,56 +237,97 @@ app.post('/chat', async (req, res) => {
             if (!functionCalls || functionCalls.length === 0) {
                 break;
             }
-
             toolTurnCount++;
             console.log(`[Sessão: ${sessionId}] Turno de Ferramenta #${toolTurnCount}. Gemini solicitou ${functionCalls.length} chamada(s).`);
-
             const functionResponses = await Promise.all(
                 functionCalls.map(async (call) => {
                     console.log(`[Sessão: ${sessionId}]   Executando: ${call.name} com args:`, JSON.stringify(call.args, null, 2));
                     const functionToCall = availableFunctions[call.name];
-
                     if (functionToCall) {
                         try {
                             const functionResult = await functionToCall(call.args);
                             console.log(`[Sessão: ${sessionId}]   Resultado de ${call.name}:`, JSON.stringify(functionResult, null, 2));
-                            return {
-                                functionResponse: { name: call.name, response: functionResult }
-                            };
+                            return { functionResponse: { name: call.name, response: functionResult } };
                         } catch (toolError) {
                             console.error(`[Sessão: ${sessionId}]   ERRO ao executar ferramenta ${call.name}:`, toolError);
-                            return {
-                                functionResponse: { name: call.name, response: { error: `Erro ao executar a ferramenta: ${toolError.message}` } }
-                            };
+                            return { functionResponse: { name: call.name, response: { error: `Erro ao executar a ferramenta: ${toolError.message}` } } };
                         }
                     } else {
                         console.warn(`[Sessão: ${sessionId}]   Função desconhecida solicitada: ${call.name}`);
-                        return {
-                            functionResponse: { name: call.name, response: { error: `Função ${call.name} não encontrada.` } }
-                        };
+                        return { functionResponse: { name: call.name, response: { error: `Função ${call.name} não encontrada.` } } };
                     }
                 })
             );
-
             console.log(`[Sessão: ${sessionId}] Enviando ${functionResponses.length} respostas das funções para Gemini...`);
             currentResponse = await chat.sendMessage(functionResponses);
         }
-        const botReplyText = currentResponse.response.text();
-        const safetyFeedback = currentResponse.response.promptFeedback;
 
-        if (!botReplyText && safetyFeedback && safetyFeedback.blockReason) {
-        } else if (!botReplyText) {
+        const botReplyText = currentResponse.response.text();
+
+        // ================== PASSO 2: INSERINDO A LÓGICA DE LOG ==================
+        if (db) { // Só tenta registrar o log se a conexão com o banco funcionou
+            try {
+                const collection = db.collection("tb_cl_user_log_acess");
+
+                const agora = new Date();
+                const logEntry = {
+                    col_data: agora.toISOString().split('T')[0],
+                    col_hora: agora.toTimeString().split(' ')[0],
+                    col_IP: req.ip,
+                    col_nome_bot: "Musashi Miyamoto Chatbot", // <<< COLOQUE O NOME OFICIAL DO SEU BOT AQUI!
+                    col_acao: `enviou_mensagem: "${userMessage}"`
+                };
+
+                await collection.insertOne(logEntry);
+                console.log("📝 Log de acesso registrado com sucesso no banco oficial.");
+
+            } catch (logError) {
+                console.error("❌ Erro ao registrar o log no MongoDB:", logError);
+            }
         }
 
         console.log(`[Sessão: ${sessionId}] Resposta Final do Modelo: ${botReplyText}`);
         res.json({ reply: botReplyText, sessionId: sessionId });
 
     } catch (error) {
+        console.error(`[Sessão: ${sessionId}] Erro geral na rota /chat:`, error);
+        res.status(500).json({ error: "Ocorreu um erro interno no servidor." });
     }
     console.log(`--- Fim da Requisição /chat ---`);
 });
 
+app.post('/api/ranking/registrar-acesso-bot', (req, res) => {
+    const { botId, nomeBot } = req.body;
+
+    if (!botId || !nomeBot) {
+        return res.status(400).json({ error: "ID e Nome do Bot são obrigatórios para o ranking." });
+    }
+
+    const botExistente = dadosRankingVitrine.find(b => b.botId === botId);
+
+    if (botExistente) {
+        botExistente.contagem += 1;
+        botExistente.ultimoAcesso = new Date();
+    } else {
+        dadosRankingVitrine.push({
+            botId: botId,
+            nomeBot: nomeBot,
+            contagem: 1,
+            ultimoAcesso: new Date()
+        });
+    }
+    
+    console.log('[RANKING] Dados de ranking atualizados:', dadosRankingVitrine);
+    res.status(201).json({ message: `Acesso ao bot ${nomeBot} registrado para ranking.` });
+});
+
+app.get('/api/ranking/visualizar', (req, res) => {
+    const rankingOrdenado = [...dadosRankingVitrine].sort((a, b) => b.contagem - a.contagem);
+    res.json(rankingOrdenado);
+});
+
 app.listen(port, () => {
+    connectDB();
     console.log(`🚀 Servidor rodando em http://localhost:${port}`);
     console.log(`Usando modelo: ${MODEL_NAME}`);
 });
