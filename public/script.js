@@ -1,11 +1,13 @@
+// client.js COMPLETO E CORRIGIDO
+
 const chatBox = document.getElementById('chat-box');
 const userInput = document.getElementById('user-input');
 const sendButton = document.getElementById('send-button');
 
-// Variável para armazenar o histórico do lado do cliente (opcional, mas útil)
-// O histórico real será mantido no servidor se implementado lá
-let clientHistory = [];
-let currentSessionId = null; // Para manter o ID da sessão de chat no servidor
+// <<< MODIFICADO >>> Variáveis para controlar a sessão e o histórico
+let chatHistory = []; // Renomeado de clientHistory para consistência
+let currentSessionId = `sessao_${Date.now()}`; // Gera um ID único quando a página carrega
+let chatStartTime = new Date(); // Guarda o momento de início do chat
 
 // --- Funções Auxiliares ---
 function addMessage(message, sender) {
@@ -13,11 +15,11 @@ function addMessage(message, sender) {
     messageDiv.classList.add('message', `${sender}-message`);
     messageDiv.textContent = message;
     chatBox.appendChild(messageDiv);
-    chatBox.scrollTop = chatBox.scrollHeight; // Auto-scroll para a última mensagem
+    chatBox.scrollTop = chatBox.scrollHeight;
 }
 
 function showTypingIndicator(show = true) {
-    removeTypingIndicator(); // Remove qualquer indicador existente
+    removeTypingIndicator();
     if (show) {
         const typingDiv = document.createElement('div');
         typingDiv.classList.add('message', 'bot-message', 'typing-indicator');
@@ -38,28 +40,26 @@ function removeTypingIndicator() {
 // --- Função Principal de Envio ---
 async function sendMessage() {
     const message = userInput.value.trim();
-    if (!message) return; // Não envia mensagens vazias
+    if (!message) return;
 
-    addMessage(message, 'user'); // Mostra a mensagem do usuário
-    clientHistory.push({ role: 'user', text: message }); // Adiciona ao histórico local
-    userInput.value = ''; // Limpa o input
-    showTypingIndicator(); // Mostra "Digitando..."
+    addMessage(message, 'user');
+    
+    // <<< MODIFICADO >>> Corrigida a estrutura do push
+    chatHistory.push({ role: 'user', parts: [{ text: message }] });
+    userInput.value = '';
+    showTypingIndicator();
 
     try {
         const response = await fetch('/chat', {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            // Envia a mensagem e o ID da sessão atual (se houver)
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ message: message, sessionId: currentSessionId }),
         });
 
-        removeTypingIndicator(); // Remove "Digitando..."
+        removeTypingIndicator();
 
         if (!response.ok) {
-            // Tenta pegar a mensagem de erro do servidor, se houver
-            const errorData = await response.json().catch(() => ({})); // Evita erro se a resposta não for JSON
+            const errorData = await response.json().catch(() => ({}));
             console.error('Erro na resposta do servidor:', response.status, errorData);
             addMessage(`Erro ${response.status}: ${errorData.error || 'Não foi possível obter a resposta do chatbot.'}`, 'bot');
             return;
@@ -68,9 +68,16 @@ async function sendMessage() {
         const data = await response.json();
 
         if (data.reply) {
-            addMessage(data.reply, 'bot'); // Mostra a resposta do bot
-            clientHistory.push({ role: 'model', text: data.reply }); // Adiciona ao histórico local
-            currentSessionId = data.sessionId; // Atualiza o ID da sessão para a próxima requisição
+            addMessage(data.reply, 'bot');
+            
+            // <<< MODIFICADO >>> Corrigida a estrutura e adicionada a chamada para salvar
+            chatHistory.push({ role: 'model', parts: [{ text: data.reply }] });
+            currentSessionId = data.sessionId;
+
+            // Chama a função para salvar o histórico completo atualizado
+            const botId = "Musashi Miyamoto Chatbot"; // Use o nome exato do seu bot
+            await salvarHistoricoSessao(currentSessionId, botId, chatStartTime, new Date(), chatHistory);
+
         } else {
              addMessage('Recebi uma resposta vazia do bot.', 'bot');
         }
@@ -85,9 +92,37 @@ async function sendMessage() {
 // --- Event Listeners ---
 sendButton.addEventListener('click', sendMessage);
 
-// Permite enviar com Enter
 userInput.addEventListener('keypress', (event) => {
     if (event.key === 'Enter') {
         sendMessage();
     }
 });
+
+// <<< ADICIONADO >>> Nova função para enviar o histórico para o backend
+async function salvarHistoricoSessao(sessionId, botId, startTime, endTime, messages) {
+    try {
+        const payload = {
+            sessionId,
+            botId,
+            startTime: startTime.toISOString(),
+            endTime: endTime.toISOString(),
+            messages // O array chatHistory completo
+        };
+
+        const response = await fetch('/api/chat/salvar-historico', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            console.error("Falha ao salvar histórico:", errorData.error || response.statusText);
+        } else {
+            const result = await response.json();
+            console.log("Histórico de sessão enviado para o servidor:", result.message);
+        }
+    } catch (error) {
+        console.error("Erro de rede ao tentar enviar histórico de sessão:", error);
+    }
+}

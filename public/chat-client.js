@@ -4,6 +4,9 @@ const sendButton = document.getElementById('sendButton');
 
 const backendUrl = 'https://chat-bot-2-0-jj5p.onrender.com';
 
+let currentSessionId = `sessao_${Date.now()}`;
+let chatStartTime = new Date();
+
 // ================== PASSO 4.1: ADICIONE A FUNÇÃO DE RANKING ==================
 // Esta função envia os dados do seu bot para o endpoint de ranking no backend.
 async function registrarAcessoParaRanking() {
@@ -91,3 +94,31 @@ userInput.addEventListener('keypress', (event) => {
 
 // Mensagem inicial (opcional)
 addMessage("Olá! Sou Musashi. Como posso guiar seu caminho hoje?", 'bot-message');
+
+async function salvarHistoricoSessao(sessionId, botId, startTime, endTime, messages) {
+    try {
+        const payload = {
+            sessionId,
+            botId,
+            startTime: startTime.toISOString(),
+            endTime: endTime.toISOString(),
+            messages // O array chatHistory completo
+        };
+
+        const response = await fetch('/api/chat/salvar-historico', { // Não precisa do backendUrl se for a mesma origem
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            console.error("Falha ao salvar histórico:", errorData.error || response.statusText);
+        } else {
+            const result = await response.json();
+            console.log("Histórico de sessão enviado para o servidor:", result.message);
+        }
+    } catch (error) {
+        console.error("Erro de rede ao tentar enviar histórico de sessão:", error);
+    }
+}

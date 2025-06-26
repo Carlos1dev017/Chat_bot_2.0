@@ -26,8 +26,52 @@ const __dirname = path.dirname(__filename);
 
 const API_KEY = process.env.GEMINI_API_KEY;
 const OPENWEATHER_API_KEY = process.env.OPENWEATHER_API_KEY;
-// ================== PASSO 1.2: PEGUE A URI DO MONGO DO .ENV ==================
-const mongoUri = process.env.MONGO_URI;
+
+// <<< ADICIONADO: Início do novo bloco de código para conexão com múltiplos bancos >>>
+// ================== NOVA LÓGICA PARA MÚLTIPLOS BANCOS DE DADOS ==================
+const mongoUriLogs = process.env.MONGO_URI_LOGS;
+const mongoUriHistoria = process.env.MONGO_URI_HISTORIA;
+
+let dbLogs;       // Conexão para o banco de logs da competição
+let dbHistoria;   // Conexão para o SEU banco de histórico
+
+async function connectToMongoDB(uri, dbNameForLog) {
+    if (!uri) {
+        console.warn(`⚠️ AVISO: URI do MongoDB para '${dbNameForLog}' não definida! A conexão será pulada.`);
+        return null;
+    }
+    const client = new MongoClient(uri, {
+        serverApi: {
+            version: ServerApiVersion.v1,
+            strict: true,
+            deprecationErrors: true,
+        }
+    });
+    try {
+        await client.connect();
+        // O nome do banco é pego da própria URI
+        const dbInstance = client.db();
+        console.log(`✅ Conectado com sucesso ao MongoDB: ${dbInstance.databaseName}`);
+        return dbInstance;
+    } catch (err) {
+        console.error(`🚨 Falha ao conectar ao MongoDB para ${dbNameForLog}:`, err);
+        return null;
+    }
+}
+
+async function initializeDatabases() {
+    dbLogs = await connectToMongoDB(mongoUriLogs, "Banco de Logs da Competição");
+    dbHistoria = await connectToMongoDB(mongoUriHistoria, "Banco de Histórico Pessoal");
+
+    if (!dbLogs) {
+        console.error("CRÍTICO: Não foi possível conectar ao banco de dados de logs. A funcionalidade de log estará desativada.");
+    }
+    if (!dbHistoria) {
+        console.error("CRÍTICO: Não foi possível conectar ao seu banco de dados de histórico. O histórico de chat não será salvo.");
+    }
+}
+// =================================================================================
+// <<< ADICIONADO: Fim do novo bloco de código >>>
 
 // ================== PASSO 3.1: CRIE O "PLACAR" DE RANKING ==================
 let dadosRankingVitrine = []; // Array em memória para simular o armazenamento do ranking
@@ -40,32 +84,6 @@ if (!OPENWEATHER_API_KEY) {
     console.warn("⚠️ AVISO: A variável OPENWEATHER_API_KEY não foi encontrada. A função de clima não funcionará.");
 }
 
-// ================== PASSO 1.3: CÓDIGO DE CONEXÃO COM O MONGODB ==================
-const dbName = "IIW2023A_Logs";
-let db; // Variável global para armazenar a conexão com o banco
-
-const connectDB = async () => {
-    if (db) return; // Se já estiver conectado, não faz nada
-    if (!mongoUri) {
-        console.warn("⚠️ AVISO: MONGO_URI não encontrada. O registro de logs no banco de dados está desativado.");
-        return;
-    }
-    try {
-        const client = new MongoClient(mongoUri, {
-            serverApi: {
-                version: ServerApiVersion.v1,
-                strict: true,
-                deprecationErrors: true,
-            }
-        });
-        await client.connect();
-        db = client.db(dbName); // Conecta ao banco de dados específico da competição
-        console.log("✅ Conectado ao MongoDB Atlas oficial da competição!");
-    } catch (err) {
-        console.error("🚨 Falha ao conectar ao MongoDB:", err);
-    }
-};
-// ===============================================================================
 
 const MODEL_NAME = "gemini-1.5-flash-latest";
 
@@ -264,17 +282,18 @@ app.post('/chat', async (req, res) => {
 
         const botReplyText = currentResponse.response.text();
 
+        // <<< MODIFICADO: Bloco de log para usar a variável dbLogs >>>
         // ================== PASSO 2: INSERINDO A LÓGICA DE LOG ==================
-        if (db) { // Só tenta registrar o log se a conexão com o banco funcionou
+        if (dbLogs) { // Só tenta registrar o log se a conexão com o banco de LOGS funcionou
             try {
-                const collection = db.collection("tb_cl_user_log_acess");
+                const collection = dbLogs.collection("tb_cl_user_log_acess");
 
                 const agora = new Date();
                 const logEntry = {
                     col_data: agora.toISOString().split('T')[0],
                     col_hora: agora.toTimeString().split(' ')[0],
                     col_IP: req.ip,
-                    col_nome_bot: "Musashi Miyamoto Chatbot", // <<< COLOQUE O NOME OFICIAL DO SEU BOT AQUI!
+                    col_nome_bot: "Musashi Miyamoto Chatbot",
                     col_acao: `enviou_mensagem: "${userMessage}"`
                 };
 
@@ -316,7 +335,7 @@ app.post('/api/ranking/registrar-acesso-bot', (req, res) => {
             ultimoAcesso: new Date()
         });
     }
-    
+
     console.log('[RANKING] Dados de ranking atualizados:', dadosRankingVitrine);
     res.status(201).json({ message: `Acesso ao bot ${nomeBot} registrado para ranking.` });
 });
@@ -326,8 +345,47 @@ app.get('/api/ranking/visualizar', (req, res) => {
     res.json(rankingOrdenado);
 });
 
+// ================== NOVO ENDPOINT PARA SALVAR HISTÓRICO ==================
+app.post('/api/chat/salvar-historico', async (req, res) => {
+    // Usa a variável dbHistoria que já configuramos
+    if (!dbHistoria) { 
+        return res.status(500).json({ error: "Servidor não conectado ao banco de dados de histórico." });
+    }
+
+    try {
+        const { sessionId, botId, startTime, endTime, messages } = req.body;
+
+        // Validação dos dados essenciais
+        if (!sessionId || !botId || !messages || !Array.isArray(messages) || messages.length === 0) {
+            return res.status(400).json({ error: "Dados incompletos para salvar histórico (sessionId, botId, messages são obrigatórios)." });
+        }
+
+        const novaSessao = {
+            sessionId,
+            userId: 'anonimo', // Conforme a estrutura, podemos deixar um valor padrão
+            botId,
+            startTime: startTime ? new Date(startTime) : new Date(),
+            endTime: endTime ? new Date(endTime) : new Date(),
+            messages, // O array completo de histórico da conversa
+            loggedAt: new Date()
+        };
+
+        const collection = dbHistoria.collection("sessoesChat"); // Usará (ou criará) esta coleção
+        const result = await collection.insertOne(novaSessao);
+
+        console.log(`[HISTÓRICO] Sessão de chat salva com sucesso no banco. ID: ${result.insertedId}`);
+        res.status(201).json({ message: "Histórico de chat salvo com sucesso!", sessionId: novaSessao.sessionId });
+
+    } catch (error) {
+        console.error("[HISTÓRICO] Erro em /api/chat/salvar-historico:", error.message);
+        res.status(500).json({ error: "Erro interno ao salvar histórico de chat." });
+    }
+});
+// =========================================================================
+
+// <<< MODIFICADO: Chamada da função de inicialização do banco de dados >>>
 app.listen(port, () => {
-    connectDB();
+    initializeDatabases();
     console.log(`🚀 Servidor rodando em http://localhost:${port}`);
     console.log(`Usando modelo: ${MODEL_NAME}`);
 });
